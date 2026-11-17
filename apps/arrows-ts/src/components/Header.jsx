@@ -5,6 +5,7 @@ import arrows_logo from '../images/arrows_logo.svg';
 import { defaultCallbackFactory } from './GptModal';
 import { sanitizeInternalGraph } from '../utils/sanitizeGraph';
 import { fromGraph, SpiresType, toYaml } from '@neo4j-arrows/linkml';
+import yaml from 'js-yaml';
 
 import {
   CommandKind
@@ -184,6 +185,54 @@ const KG_RELATION_SETS = Object.fromEntries(
     new Set(Object.values(byPair).flat().map(normalizeForCompliance)),
   ])
 );
+
+// The engine's grounding can return ids outside a class's declared id_prefixes (e.g. the
+// sqlite:obo:mondo annotator returns HP_0002099 first for "asthma"). Re-pick each grounded
+// mention's `id` as the first entry in `ids` whose prefix is in its class's id_prefixes,
+// falling back to the engine's `id` when none match. Applied once to the engine result so the
+// result view, relation triples, CSV/BioC exports, Bio-Viber payload and history all agree.
+const idPrefixOf = id => String(id || '').split(/[_:]/)[0].toUpperCase();
+const pickPrefixedId = (mention, prefixes) => {
+  if (!prefixes?.length || !mention || typeof mention !== 'object' || !Array.isArray(mention.ids)) return mention;
+  const allowed = new Set(prefixes.map(p => String(p).toUpperCase()));
+  const match = mention.ids.find(id => allowed.has(idPrefixOf(id)));
+  return match && match !== mention.id ? { ...mention, id: match } : mention;
+};
+const applyIdPrefixes = (result, schemaYaml) => {
+  let classes;
+  try { classes = yaml.load(schemaYaml || '')?.classes; } catch (_) { return result; }
+  if (!result?.responses || !classes || typeof classes !== 'object') return result;
+  const classDef = name => classes[name]
+    || Object.entries(classes).find(([k]) => k.toLowerCase() === String(name || '').toLowerCase())?.[1];
+  const prefixesOf = name => {
+    const p = classDef(name)?.id_prefixes;
+    return Array.isArray(p) ? p : [];
+  };
+  const responses = {};
+  Object.entries(result.responses).forEach(([cls, data]) => {
+    if (!data || typeof data !== 'object') { responses[cls] = data; return; }
+    const slots = classDef(cls)?.slot_usage || {};
+    const subjPrefixes = prefixesOf(slots.subject?.range);
+    const objPrefixes = prefixesOf(slots.object?.range);
+    const entityPrefixes = prefixesOf(cls);
+    const fixRelation = m => (m && typeof m === 'object'
+      ? { ...m, subject: pickPrefixedId(m.subject, subjPrefixes), object: pickPrefixedId(m.object, objPrefixes) }
+      : m);
+    const out = { ...data };
+    const rKey = `${cls}Relationships`;
+    if (Array.isArray(data[rKey])) out[rKey] = data[rKey].map(fixRelation);
+    const mentions = data.schemaResponse?.mentions;
+    if (Array.isArray(mentions)) {
+      const isRelation = Array.isArray(data[rKey]) || slots.subject || slots.object;
+      out.schemaResponse = {
+        ...data.schemaResponse,
+        mentions: mentions.map(m => (isRelation ? fixRelation(m) : pickPrefixedId(m, entityPrefixes))),
+      };
+    }
+    responses[cls] = out;
+  });
+  return { ...result, responses };
+};
 
 const storageStatusMessage = (props) => {
   const storageName = storageNames[props.storage.mode];
@@ -651,15 +700,16 @@ class Header extends PureComponent {
                 }
               }
             } else if (payload.type === 'done') {
-              const responses = payload.responses || {};
-              const trace = payload.trace || {};
+              const result = applyIdPrefixes(payload, this.state.extractSchema);
+              const responses = result.responses || {};
+              const trace = result.trace || {};
               const visibleClasses = {};
               Object.keys(responses).forEach(k => { visibleClasses[k] = true; });
               Object.keys(trace).forEach(k => { visibleClasses[k] = true; });
               addLog('🎉', 'Extraction complete!');
-              this.saveExtractionToHistory(payload);
+              this.saveExtractionToHistory(result);
               this.setState(prev => ({
-                extractResult: payload,
+                extractResult: result,
                 extractVisibleClasses: visibleClasses,
                 extractView: 'result',
                 extractActiveTab: 'text',
@@ -1144,7 +1194,7 @@ class Header extends PureComponent {
                   if (historySelectedItem) {
                     // ── Detail view ─────────────────────────────────────
                     let parsedResult = null;
-                    try { parsedResult = JSON.parse(historySelectedItem.result_json); } catch (_) {}
+                    try { parsedResult = applyIdPrefixes(JSON.parse(historySelectedItem.result_json), historySelectedItem.schema_yaml); } catch (_) {}
 
                     // Helper: safely classify classes and count mentions
                     const _safeIsRe = (traceVal, cls) => {
@@ -1308,7 +1358,7 @@ class Header extends PureComponent {
 
                         {(this.state._historyDetailTab || 'Entities & Relations') === 'Result JSON' && (
                           <pre style={{ background: '#0f172a', color: '#e2e8f0', borderRadius: '8px', padding: '12px', fontSize: '12px', overflowX: 'auto', maxHeight: '340px', overflowY: 'auto' }}>
-                            {(() => { try { return historySelectedItem.result_json ? JSON.stringify(JSON.parse(historySelectedItem.result_json), null, 2) : '(no result saved)'; } catch (_) { return historySelectedItem.result_json || '(no result saved)'; } })()}
+                            {(() => { try { return parsedResult ? JSON.stringify(parsedResult, null, 2) : (historySelectedItem.result_json || '(no result saved)'); } catch (_) { return historySelectedItem.result_json || '(no result saved)'; } })()}
                           </pre>
                         )}
                         {/* load into form */}
@@ -1318,6 +1368,7 @@ class Header extends PureComponent {
                               this.setState({
                                 extractMainTab: 'extract',
                                 extractText: historySelectedItem.input_text || '',
+                                selectedPubmedArticle: null,
                                 extractView: 'input',
                                 historySelectedItem: null,
                               });
@@ -2571,13 +2622,54 @@ class Header extends PureComponent {
                           {activeTab === 'relations' && (() => {
                             const selectedKG = this.state.extractSelectedKG;
 
+                            // miRNA-KG names mature miRNAs like "hsa-miR-21-5p" and stores RNAcentral IDs.
+                            // A grounded miRNA goes as {label, id} with its RNAcentral ID (never a
+                            // miRBase MIMAT ID); otherwise as a plain label with the "hsa-" prefix added.
+                            // Never add a strand: "miR-21" stays strandless for Bio-Viber's fallback.
+                            const isMirna = s => /^(?:[a-z]{3}-)?(?:miR|let)-/i.test(s || '');
+                            const withHsaPrefix = s => (/^(?:miR|let)-/i.test(s) ? `hsa-${s}` : s);
+                            const rnacentralId = v => {
+                              for (const c of [v.id, ...(Array.isArray(v.ids) ? v.ids : [])]) {
+                                const m = /^(?:RNAcentral[:_])?(URS[0-9A-F]{10}_\d+)$/i.exec(String(c || ''));
+                                if (m) return `RNAcentral:${m[1].toUpperCase()}`;
+                              }
+                              return null;
+                            };
+                            const toBioViberEntity = v => {
+                              if (v == null) return '';
+                              if (typeof v !== 'object') {
+                                const s = String(v);
+                                return isMirna(s) ? withHsaPrefix(s) : s;
+                              }
+                              const label = v.label || v.name || '';
+                              if (isMirna(label)) {
+                                const id = rnacentralId(v);
+                                return id ? { label, id } : withHsaPrefix(label);
+                              }
+                              return v.id || JSON.stringify(v);
+                            };
+                            const toBioViberPredicate = p => (typeof p === 'object' && p !== null ? (p.id || JSON.stringify(p)) : String(p ?? ''));
+
                             const sendToBioViber = async () => {
-                              const triples = _buildRelRows().map(({ cls, subj, pred, obj }) => ({
-                                class: cls, subject: subj, predicate: pred, object: obj,
-                              }));
+                              const triples = [];
+                              relationKeys.forEach(cls => {
+                                const rData = responses[cls] || {};
+                                (rData[`${cls}Relationships`] || rData?.schemaResponse?.mentions || []).filter(Boolean).forEach(m => {
+                                  triples.push({
+                                    class: cls,
+                                    subject: toBioViberEntity(m.subject),
+                                    predicate: toBioViberPredicate(m.predicate),
+                                    object: toBioViberEntity(m.object),
+                                  });
+                                });
+                              });
                               const apiUrl = new URL('https://bio-viber.biodata.di.unimi.it/api/schemalink');
                               apiUrl.searchParams.set('json', JSON.stringify(triples));
                               apiUrl.searchParams.set('kg', selectedKG);
+                              apiUrl.searchParams.set('text', this.state.extractText || '');
+                              // Real PMID only when the text came from the PubMed search; otherwise
+                              // omit it and let Bio-Viber generate its own placeholder ID.
+                              if (_pubmed?.pmid) apiUrl.searchParams.set('pmid', String(_pubmed.pmid));
 
                               this.setState({ bioViberSending: true, bioViberError: null });
                               try {
@@ -2600,6 +2692,16 @@ class Header extends PureComponent {
                               compliant: relationHumanized.filter(r => KG_RELATION_SETS[kg].has(normalizeForCompliance(r.humanized))),
                               total: relationHumanized.length,
                             }));
+                            // Only offer the KG choice if at least one relation that was actually
+                            // extracted (non-zero mentions) is compliant with some KG.
+                            const mentionCount = cls => {
+                              const rData = responses[cls] || {};
+                              return (rData[`${cls}Relationships`] || rData?.schemaResponse?.mentions || []).filter(Boolean).length;
+                            };
+                            const isKGUsable = compliant => compliant.some(c => mentionCount(c.cls) > 0);
+                            const hasCompliantRelations = kgCompliance.some(({ compliant }) => isKGUsable(compliant));
+                            // A KG picked in a previous extraction may not be usable for this one.
+                            const selectedKGUsable = kgCompliance.some(({ kg, compliant }) => kg === selectedKG && isKGUsable(compliant));
 
                             return (
                           <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
@@ -2641,6 +2743,7 @@ class Header extends PureComponent {
                             })}
 
                                 {/* ── Bio-Viber: KG compliance + send ── */}
+                                {hasCompliantRelations && (
                                 <div style={{ marginTop: '8px', paddingTop: '16px', borderTop: '1px solid #e2e8f0' }}>
                                   <div style={{ fontSize: '14px', fontWeight: 600, color: '#0f172a', marginBottom: '4px' }}>
                                     Please choose your Knowledge Graph:
@@ -2650,19 +2753,23 @@ class Header extends PureComponent {
                                   </div>
                                   <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '10px' }}>
                                     {kgCompliance.map(({ kg, compliant, total }) => {
-                                      const isSelected = selectedKG === kg;
+                                      const usable = isKGUsable(compliant);
+                                      const isSelected = usable && selectedKG === kg;
                                       return (
-                                        <div key={kg} style={{
+                                        <div key={kg} title={usable ? undefined : 'No extracted relations are compliant with this Knowledge Graph'} style={{
                                           border: `1px solid ${isSelected ? '#1d4ed8' : '#e2e8f0'}`,
                                           borderRadius: '8px', padding: '10px 12px',
                                           background: isSelected ? '#eff6ff' : 'white',
+                                          opacity: usable ? 1 : 0.45,
+                                          filter: usable ? 'none' : 'grayscale(1)',
                                         }}>
-                                          <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+                                          <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: usable ? 'pointer' : 'not-allowed' }}>
                                             <Radio
                                               name="bioViberKG"
                                               value={kg}
                                               checked={isSelected}
-                                              onChange={() => this.setState({ extractSelectedKG: kg })}
+                                              disabled={!usable}
+                                              onChange={() => usable && this.setState({ extractSelectedKG: kg })}
                                             />
                                             <span style={{ fontWeight: 600, fontSize: '13px' }}>{kg}</span>
                                             <span style={{
@@ -2693,7 +2800,7 @@ class Header extends PureComponent {
                                   <div style={{ marginTop: '16px' }}>
                                     <Button
                                       primary
-                                      disabled={!selectedKG}
+                                      disabled={!selectedKGUsable}
                                       loading={this.state.bioViberSending}
                                       onClick={sendToBioViber}
                                       content="Send to Bio-Viber"
@@ -2705,6 +2812,7 @@ class Header extends PureComponent {
                           </div>
                         )}
                                 </div>
+                                )}
                               </div>
                             );
                           })()}
